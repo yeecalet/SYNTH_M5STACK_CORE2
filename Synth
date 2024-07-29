@@ -1,0 +1,1000 @@
+#include <M5Core2.h>
+#include <math.h>
+#include <vector>
+
+#define SAMPLE_RATE 44100
+
+// Pines de los encoders
+#define ENCODER1_CLK 3
+#define ENCODER1_DT 13
+
+#define ENCODER2_CLK 21
+#define ENCODER2_DT 32
+
+// Estados iniciales de los encoders y botones
+int lastEncoderState1 = LOW;
+int encoderValue1 = 0;
+bool lastButtonState1 = HIGH;
+
+int lastEncoderState2 = LOW;
+int encoderValue2 = 0;
+bool lastButtonState2 = HIGH;
+
+// Pines de los botones pulsadores
+const int buttonPins[12] = {0, 19, 33, 22, 14, 1, 26, 36, 35, 18, 2, 27};
+
+// Estados de los botones pulsadores
+bool buttonStates[12] = {false, false, false, false, false, false, false, false, false, false, false, false};
+
+// Frecuencias de las notas (en Hz) correspondientes a los botones
+const float noteFrequencies[12] = {
+    1046.50, 1108.73, 1174.66, 1244.51, 1318.51, 1396.91, 
+    1479.98, 1567.98, 1661.22, 1760.00, 1864.66, 1975.53
+};
+
+// Tipos de ondas
+enum WaveType { SINE, SQUARE, TRIANGLE, SAWTOOTH, NUM_WAVE_TYPES };
+
+class Oscillator {
+public:
+    float baseFrequency;
+    float amplitude;
+    WaveType waveType;
+    float phase;
+    bool isOn;
+    int octaveShift;
+
+    Oscillator(float freq, float amp, WaveType type, bool on = true) {
+        baseFrequency = freq;
+        amplitude = amp;
+        waveType = type;
+        phase = 0.0;
+        isOn = on;
+        octaveShift = 0;
+    }
+
+    float generateWave() {
+        if (!isOn) return 0.0;
+        float sample = 0.0;
+        float increment = 2 * PI * getFrequency() / SAMPLE_RATE;
+        phase += increment;
+        if (phase > 2 * PI) phase -= 2 * PI;
+
+        switch (waveType) {
+            case SINE:
+                sample = sin(phase);
+                break;
+            case SQUARE:
+                sample = (sin(phase) >= 0) ? 1.0 : -1.0;
+                break;
+            case TRIANGLE:
+                sample = asin(sin(phase)) * (2 / PI);
+                break;
+            case SAWTOOTH:
+                sample = (2.0 / PI) * (phase - PI);
+                break;
+        }
+
+        return sample * amplitude;
+    }
+
+    float getFrequency() {
+        return baseFrequency * pow(2, octaveShift);
+    }
+
+    void nextWaveType() {
+        waveType = static_cast<WaveType>((waveType + 1) % NUM_WAVE_TYPES);
+    }
+
+    void updateOctaveShift(int shift) {
+        octaveShift = constrain(octaveShift + shift, -4, 3);
+    }
+
+    String getWaveTypeName() {
+        switch (waveType) {
+            case SINE:
+                return "SINE";
+            case SQUARE:
+                return "SQUARE";
+            case TRIANGLE:
+                return "TRIANGLE";
+            case SAWTOOTH:
+                return "SAWTOOTH";
+        }
+        return "";
+    }
+};
+
+// Clase ADSR
+class ADSR {
+public:
+    float attack;
+    float decay;
+    float sustain;
+    float release;
+    bool noteOn;
+    bool isOn;
+    float noteOnTime;
+    float noteOffTime;
+
+    ADSR() {
+        attack = 0.1;
+        decay = 0.2;
+        sustain = 0.6;
+        release = 0.5;
+        noteOn = false;
+        isOn = false;
+        noteOnTime = 0.0;
+        noteOffTime = 0.0;
+    }
+
+    void noteOnTrigger(float currentTime) {
+        noteOn = true;
+        noteOnTime = currentTime;
+    }
+
+    void noteOffTrigger(float currentTime) {
+        noteOn = false;
+        noteOffTime = currentTime;
+    }
+
+    float applyEnvelope(float input, float currentTime) {
+        if (!isOn) return input;
+
+        float time = currentTime - noteOnTime;
+        if (noteOn) {
+            if (time < attack) {
+                return input * (time / attack);
+            } else if (time < attack + decay) {
+                return input * ((1.0 - (time - attack) / decay) * (1.0 - sustain) + sustain);
+            } else {
+                return input * sustain;
+            }
+        } else {
+            float releaseTime = currentTime - noteOffTime;
+            if (releaseTime < release) {
+                return input * sustain * (1.0 - releaseTime / release);
+            } else {
+                return 0.0;
+            }
+        }
+    }
+};
+
+// Clase base para los filtros de Butterworth de 4º orden
+class ButterworthFilter {
+public:
+    float cutoff;
+    float resonance;
+    bool isOn;
+    std::vector<float> a, b;
+    std::vector<float> x, y;
+
+    ButterworthFilter() {
+        resonance = 1.0;
+        isOn = false;
+
+        a.resize(5, 0.0);
+        b.resize(5, 0.0);
+        x.resize(5, 0.0);
+        y.resize(5, 0.0);
+    }
+
+    virtual void calculateCoefficients() = 0;
+
+    void applyFilter(float &sample) {
+        if (isOn) {
+            for (int i = 4; i > 0; --i) {
+                x[i] = x[i - 1];
+                y[i] = y[i - 1];
+            }
+            x[0] = sample;
+            y[0] = b[0] * x[0] + b[1] * x[1] + b[2] * x[2] - a[1] * y[1] - a[2] * y[2];
+            sample = y[0];
+        }
+    }
+};
+
+// Clase para el filtro paso bajo de Butterworth de 4º orden
+class LowPassFilter : public ButterworthFilter {
+public:
+    LowPassFilter() {
+        cutoff = 20000.0;
+        calculateCoefficients();
+    }
+
+    void calculateCoefficients() override {
+        float omega = 2 * M_PI * cutoff / SAMPLE_RATE;
+        float sin_omega = sin(omega);
+        float cos_omega = cos(omega);
+        float alpha = sin_omega / (2 * resonance);
+
+        float a0 = 1 + alpha;
+        a[0] = 1 / a0;
+        a[1] = -2 * cos_omega / a0;
+        a[2] = (1 - alpha) / a0;
+        b[0] = (1 - cos_omega) / 2 / a0;
+        b[1] = (1 - cos_omega) / a0;
+        b[2] = b[0];
+    }
+};
+
+// Clase para el filtro paso alto de Butterworth de 4º orden
+class HighPassFilter : public ButterworthFilter {
+public:
+    HighPassFilter() {
+        cutoff = 20.0;
+        calculateCoefficients();
+    }
+
+    void calculateCoefficients() override {
+        float omega = 2 * M_PI * cutoff / SAMPLE_RATE;
+        float sin_omega = sin(omega);
+        float cos_omega = cos(omega);
+        float alpha = sin_omega / (2 * resonance);
+
+        float a0 = 1 + alpha;
+        a[0] = 1 / a0;
+        a[1] = -2 * cos_omega / a0;
+        a[2] = (1 - alpha) / a0;
+        b[0] = (1 + cos_omega) / 2 / a0;
+        b[1] = -(1 + cos_omega) / a0;
+        b[2] = b[0];
+    }
+};
+
+LowPassFilter lowPassFilter;
+HighPassFilter highPassFilter;
+ADSR adsr;
+
+std::vector<Oscillator> oscillators;
+
+class EffectProcessor {
+public:
+    bool isReverbOn;
+    float reverbDecayFactor;  // Rango: 0.0 a 1.0
+    int reverbDelayLength;    // Rango: 10 a 1000 milisegundos
+    std::vector<float> reverbBuffer;
+
+    bool isDelayOn;
+    float delayFeedback;      // Rango: 0.0 a 0.9
+    int delayLength;          // Rango: 10 a 2000 milisegundos
+    std::vector<float> delayBuffer;
+
+    bool isChorusOn;
+    float chorusDepth;        // Rango: 0.0 a 1.0
+    float chorusRate;         // Rango: 0.1 a 5.0 Hz
+    float chorusPhase;        // Rango: 0.0 a 2π (0 a 360 grados)
+
+    EffectProcessor() {
+        isReverbOn = false;
+        reverbDecayFactor = 0.5;
+        reverbDelayLength = 500;
+        reverbBuffer.resize(reverbDelayLength, 0.0);
+
+        isDelayOn = false;
+        delayFeedback = 0.5;
+        delayLength = 500;
+        delayBuffer.resize(delayLength, 0.0);
+
+        isChorusOn = false;
+        chorusDepth = 0.5;
+        chorusRate = 0.5;
+        chorusPhase = M_PI;
+    }
+
+    void applyReverbEffect(float &sample) {
+        if (!isReverbOn) return;
+
+        int index = reverbBuffer.size() - reverbDelayLength;
+        float delayedSample = reverbBuffer[index];
+        reverbBuffer.push_back(sample + reverbDecayFactor * delayedSample);
+        reverbBuffer.erase(reverbBuffer.begin());
+        sample = sample * (1.0 - reverbDecayFactor) + delayedSample * reverbDecayFactor;
+    }
+
+    void applyDelayEffect(float &sample) {
+        if (!isDelayOn) return;
+
+        int index = delayBuffer.size() - delayLength;
+        if (index < 0) index += delayBuffer.size();
+
+        float delayedSample = delayBuffer[index];
+        delayBuffer.push_back(sample + delayFeedback * delayedSample);
+
+        if (delayBuffer.size() > delayLength * 2) {
+            delayBuffer.erase(delayBuffer.begin());
+        }
+
+        sample = sample * (1.0 - delayFeedback) + delayedSample * delayFeedback;
+    }
+
+    void applyChorusEffect(float &sample) {
+        if (!isChorusOn) return;
+
+        int chorusDelay = chorusDepth * (0.5 + 0.5 * sin(2 * PI * chorusRate * chorusPhase / SAMPLE_RATE));
+        int index = delayBuffer.size() - chorusDelay;
+        sample += delayBuffer[index];
+        chorusPhase += 1;
+        if (chorusPhase >= SAMPLE_RATE) chorusPhase -= SAMPLE_RATE;
+    }
+};
+
+
+EffectProcessor effectProcessor;
+
+// Declaración de funciones
+void displayOscillatorSettings(String oscLabel, Oscillator &osc);
+void displayADSRSettings();
+void drawADSR();
+void displayMainScreen();
+void displayEffectSettings(const String &effectLabel, const String &effectType);
+void displayEffectsSettings();
+void displayMixerSettings();
+void displayEQSettings();
+void drawEQCurve();
+void handleOscillatorSettings(String oscLabel, Oscillator &osc);
+void handleButtonPress();
+void displayOctaveShift(Oscillator &osc);
+void displayFilterSettings(ButterworthFilter &filter, int yOffset);
+void displayEffectProcessorSettings(const String &effectLabel, const String &effectType);
+
+void setup() {
+    M5.begin();
+
+    // Configuración de pines de encoders y botones
+    pinMode(ENCODER1_CLK, INPUT);
+    pinMode(ENCODER1_DT, INPUT);
+
+    pinMode(ENCODER2_CLK, INPUT);
+    pinMode(ENCODER2_DT, INPUT);
+
+    // Configuración de pines de botones pulsadores
+    for (int i = 0; i < 7; ++i) {
+        pinMode(buttonPins[i], INPUT_PULLUP);
+    }
+
+    // Inicializar osciladores con diferentes frecuencias
+    for (int i = 0; i < 7; ++i) {
+        oscillators.push_back(Oscillator(noteFrequencies[i], 1.0, SINE));
+    }
+
+    // Mostrar directamente la pantalla principal
+    displayMainScreen();
+}
+
+void loop() {
+    M5.update();
+
+    handleButtonPress();
+
+    if (M5.BtnA.wasPressed()) {
+        displayMainScreen();
+        return;
+    }
+
+    // Manejo de pantallas táctiles
+    if (M5.Touch.ispressed()) {
+        TouchPoint_t point = M5.Touch.getPressPoint();
+        int x = point.x;
+        int y = point.y;
+
+        // OSC1 Settings
+        if (x > 10 && x < 150 && y > 10 && y < 60) {
+            handleOscillatorSettings("OSC1", oscillators[0]);
+        }
+        // OSC2 Settings
+        else if (x > 10 && x < 150 && y > 70 && y < 120) {
+            handleOscillatorSettings("OSC2", oscillators[1]);
+        }
+        // OSC3 Settings
+        else if (x > 10 && x < 150 && y > 130 && y < 180) {
+            handleOscillatorSettings("OSC3", oscillators[2]);
+        }
+        // OSC4 Settings
+        else if (x > 10 && x < 150 && y > 190 && y < 240) {
+            handleOscillatorSettings("OSC4", oscillators[3]);
+        }
+        // Effects Settings
+        else if (x > 160 && x < 300 && y > 10 && y < 120) {
+            displayEffectsSettings();
+            while (true) {
+                M5.update();
+                if (M5.BtnA.wasPressed()) {
+                    displayMainScreen();
+                    break;
+                }
+                if (M5.Touch.ispressed()) {
+                    TouchPoint_t innerPoint = M5.Touch.getPressPoint();
+                    int ix = innerPoint.x;
+                    int iy = innerPoint.y;
+
+                    // Reverb Settings
+                    if (ix > 10 && ix < 150 && iy > 70 && iy < 120) {
+                        displayEffectProcessorSettings("Reverb", "Reverb");
+                        while (true) {
+                            M5.update();
+                            if (M5.BtnA.wasPressed()) {
+                                displayEffectsSettings();
+                                break;
+                            }
+                            if (M5.Touch.ispressed()) {
+                                TouchPoint_t effectPoint = M5.Touch.getPressPoint();
+                                int ex = effectPoint.x;
+                                int ey = effectPoint.y;
+                                if (ex > 10 && ex < 110 && ey > 130 && ey < 180) {
+                                    effectProcessor.isReverbOn = !effectProcessor.isReverbOn;
+                                    displayEffectProcessorSettings("Reverb", "Reverb");
+                                }
+                            }
+                            // Ajuste de valores de Reverb
+                            int currentEncoderState1 = digitalRead(ENCODER1_CLK);
+                            if (currentEncoderState1 != lastEncoderState1) {
+                                int dtState = digitalRead(ENCODER1_DT);
+                                if (dtState == LOW && currentEncoderState1 == HIGH) {
+                                    effectProcessor.reverbDecayFactor -= 0.1;
+                                } else if (dtState == HIGH && currentEncoderState1 == HIGH) {
+                                    effectProcessor.reverbDecayFactor += 0.1;
+                                }
+                                effectProcessor.reverbDecayFactor = constrain(effectProcessor.reverbDecayFactor, 0.0, 0.9);
+                                displayEffectProcessorSettings("Reverb", "Reverb");
+                            }
+                            lastEncoderState1 = currentEncoderState1;
+
+                            int currentEncoderState2 = digitalRead(ENCODER2_CLK);
+                            if (currentEncoderState2 != lastEncoderState2) {
+                                int dtState = digitalRead(ENCODER2_DT);
+                                if (dtState == LOW && currentEncoderState2 == HIGH) {
+                                    effectProcessor.reverbDelayLength -= 10;
+                                } else if (dtState == HIGH && currentEncoderState2 == HIGH) {
+                                    effectProcessor.reverbDelayLength += 10;
+                                }
+                                effectProcessor.reverbDelayLength = constrain(effectProcessor.reverbDelayLength, 10, 1000);
+                                displayEffectProcessorSettings("Reverb", "Reverb");
+                            }
+                            lastEncoderState2 = currentEncoderState2;
+                        }
+                    }
+                    // Delay Settings
+                    else if (ix > 10 && ix < 150 && iy > 130 && iy < 180) {
+                        displayEffectProcessorSettings("Delay", "Delay");
+                        while (true) {
+                            M5.update();
+                            if (M5.BtnA.wasPressed()) {
+                                displayEffectsSettings();
+                                break;
+                            }
+                            if (M5.Touch.ispressed()) {
+                                TouchPoint_t effectPoint = M5.Touch.getPressPoint();
+                                int ex = effectPoint.x;
+                                int ey = effectPoint.y;
+                                if (ex > 10 && ex < 110 && ey > 130 && ey < 180) {
+                                    effectProcessor.isDelayOn = !effectProcessor.isDelayOn;
+                                    displayEffectProcessorSettings("Delay", "Delay");
+                                }
+                            }
+                            // Ajuste de valores de Delay
+                            int currentEncoderState1 = digitalRead(ENCODER1_CLK);
+                            if (currentEncoderState1 != lastEncoderState1) {
+                                int dtState = digitalRead(ENCODER1_DT);
+                                if (dtState == LOW && currentEncoderState1 == HIGH) {
+                                    effectProcessor.delayFeedback -= 0.1;
+                                } else if (dtState == HIGH && currentEncoderState1 == HIGH) {
+                                    effectProcessor.delayFeedback += 0.1;
+                                }
+                                effectProcessor.delayFeedback = constrain(effectProcessor.delayFeedback, 0.0, 0.9);
+                                displayEffectProcessorSettings("Delay", "Delay");
+                            }
+                            lastEncoderState1 = currentEncoderState1;
+
+                            int currentEncoderState2 = digitalRead(ENCODER2_CLK);
+                            if (currentEncoderState2 != lastEncoderState2) {
+                                int dtState = digitalRead(ENCODER2_DT);
+                                if (dtState == LOW && currentEncoderState2 == HIGH) {
+                                    effectProcessor.delayLength -= 10;
+                                } else if (dtState == HIGH && currentEncoderState2 == HIGH) {
+                                    effectProcessor.delayLength += 10;
+                                }
+                                effectProcessor.delayLength = constrain(effectProcessor.delayLength, 10, 1000);
+                                displayEffectProcessorSettings("Delay", "Delay");
+                            }
+                            lastEncoderState2 = currentEncoderState2;
+                        }
+                    }
+                    // Chorus Settings
+                    else if (ix > 10 && ix < 150 && iy > 190 && iy < 240) {
+                        displayEffectProcessorSettings("Chorus", "Chorus");
+                        while (true) {
+                            M5.update();
+                            if (M5.BtnA.wasPressed()) {
+                                displayEffectsSettings();
+                                break;
+                            }
+                            if (M5.Touch.ispressed()) {
+                                TouchPoint_t effectPoint = M5.Touch.getPressPoint();
+                                int ex = effectPoint.x;
+                                int ey = effectPoint.y;
+                                if (ex > 10 && ex < 110 && ey > 130 && ey < 180) {
+                                    effectProcessor.isChorusOn = !effectProcessor.isChorusOn;
+                                    displayEffectProcessorSettings("Chorus", "Chorus");
+                                }
+                            }
+                            // Ajuste de valores de Chorus
+                            int currentEncoderState1 = digitalRead(ENCODER1_CLK);
+                            if (currentEncoderState1 != lastEncoderState1) {
+                                int dtState = digitalRead(ENCODER1_DT);
+                                if (dtState == LOW && currentEncoderState1 == HIGH) {
+                                    effectProcessor.chorusDepth -= 0.1;
+                                } else if (dtState == HIGH && currentEncoderState1 == HIGH) {
+                                    effectProcessor.chorusDepth += 0.1;
+                                }
+                                effectProcessor.chorusDepth = constrain(effectProcessor.chorusDepth, 0.0, 0.9);
+                                displayEffectProcessorSettings("Chorus", "Chorus");
+                            }
+                            lastEncoderState1 = currentEncoderState1;
+
+                            int currentEncoderState2 = digitalRead(ENCODER2_CLK);
+                            if (currentEncoderState2 != lastEncoderState2) {
+                                int dtState = digitalRead(ENCODER2_DT);
+                                if (dtState == LOW && currentEncoderState2 == HIGH) {
+                                    effectProcessor.chorusRate -= 0.1;
+                                } else if (dtState == HIGH && currentEncoderState2 == HIGH) {
+                                    effectProcessor.chorusRate += 0.1;
+                                }
+                                effectProcessor.chorusRate = constrain(effectProcessor.chorusRate, 0.1, 5.0);
+                                displayEffectProcessorSettings("Chorus", "Chorus");
+                            }
+                            lastEncoderState2 = currentEncoderState2;
+                        }
+                    }
+                }
+            }
+        }
+        // Mixer Settings
+        else if (x > 160 && x < 300 && y > 130 && y < 240) {
+            displayMixerSettings();
+            while (true) {
+                M5.update();
+                if (M5.BtnA.wasPressed()) {
+                    displayMainScreen();
+                    break;
+                }
+                if (M5.Touch.ispressed()) {
+                    TouchPoint_t eqPoint = M5.Touch.getPressPoint();
+                    int ex = eqPoint.x;
+                    int ey = eqPoint.y;
+                    if (ex > 10 && ex < 150 && ey > 70 && ey < 120) {
+                        displayADSRSettings();
+                        while (true) {
+                            M5.update();
+                            if (M5.BtnA.wasPressed()) {
+                                displayMixerSettings();
+                                break;
+                            }
+                            // Ajuste de valores ADSR
+                            int currentEncoderState1 = digitalRead(ENCODER1_CLK);
+                            if (currentEncoderState1 != lastEncoderState1) {
+                                int dtState1 = digitalRead(ENCODER1_DT);
+                                if (dtState1 == LOW && currentEncoderState1 == HIGH) {
+                                    adsr.attack -= 0.1;
+                                } else if (dtState1 == HIGH && currentEncoderState1 == HIGH) {
+                                    adsr.attack += 0.1;
+                                }
+                                adsr.attack = constrain(adsr.attack, 0.0, 4.0);
+                                displayADSRSettings();
+                            }
+                            lastEncoderState1 = currentEncoderState1;
+
+                            int currentEncoderState2 = digitalRead(ENCODER2_CLK);
+                            if (currentEncoderState2 != lastEncoderState2) {
+                                int dtState2 = digitalRead(ENCODER2_DT);
+                                if (dtState2 == LOW && currentEncoderState2 == HIGH) {
+                                    adsr.sustain -= 0.1;
+                                } else if (dtState2 == HIGH && currentEncoderState2 == HIGH) {
+                                    adsr.sustain += 0.1;
+                                }
+                                adsr.sustain = constrain(adsr.sustain, 0.0, 1.0);
+                                displayADSRSettings();
+                            }
+                            lastEncoderState2 = currentEncoderState2;
+                        }
+                    }
+                    // EQ Settings
+                    else if (ex > 10 && ex < 150 && ey > 130 && ey < 180) {
+                        displayEQSettings();
+                        while (true) {
+                            M5.update();
+                            // Ajuste de valores de filtros con Encoder 1 para LowPass Filter
+                            int currentEncoderState1 = digitalRead(ENCODER1_CLK);
+                            if (currentEncoderState1 != lastEncoderState1) {
+                                int dtState1 = digitalRead(ENCODER1_DT);
+                                if (dtState1 == LOW && currentEncoderState1 == HIGH) {
+                                    lowPassFilter.cutoff = constrain(lowPassFilter.cutoff - 500, 2500, 20000);
+                                } else if (dtState1 == HIGH && currentEncoderState1 == HIGH) {
+                                    lowPassFilter.cutoff = constrain(lowPassFilter.cutoff + 500, 2500, 20000);
+                                }
+                                displayEQSettings();
+                            }
+                            lastEncoderState1 = currentEncoderState1;
+
+                            // Ajuste de valores de filtros con Encoder 2 para HighPass Filter
+                            int currentEncoderState2 = digitalRead(ENCODER2_CLK);
+                            if (currentEncoderState2 != lastEncoderState2) {
+                                int dtState2 = digitalRead(ENCODER2_DT);
+                                if (dtState2 == LOW && currentEncoderState2 == HIGH) {
+                                    highPassFilter.cutoff = constrain(highPassFilter.cutoff - 19, 20, 400);
+                                } else if (dtState2 == HIGH && currentEncoderState2 == HIGH) {
+                                    highPassFilter.cutoff = constrain(highPassFilter.cutoff + 19, 20, 400);
+                                }
+                                displayEQSettings();
+                            }
+                            lastEncoderState2 = currentEncoderState2;
+
+                            if (M5.BtnA.wasPressed()) {
+                                displayMixerSettings();
+                                break;
+                            }
+                        }
+                    }
+                    // Botón ON/OFF para los filtros
+                    else if (ex > 160 && ex < 260 && ey > 130 && ey < 180) {
+                        lowPassFilter.isOn = !lowPassFilter.isOn;
+                        highPassFilter.isOn = !highPassFilter.isOn;
+                        displayMixerSettings();
+                    }
+                    // Botón ON/OFF para ADSR
+                    else if (ex > 160 && ex < 260 && ey > 70 && ey < 120) {
+                        adsr.isOn = !adsr.isOn;
+                        displayMixerSettings();
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Definiciones de las funciones
+void displayMainScreen() {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(2);
+
+    // Botones para Osciladores
+    int buttonHeight = 50;
+    int buttonWidth = 140;
+
+    M5.Lcd.fillRect(10, 10, buttonWidth, buttonHeight, BLUE);
+    M5.Lcd.drawString("OSC1", 50, 25);
+
+    M5.Lcd.fillRect(10, 70, buttonWidth, buttonHeight, BLUE);
+    M5.Lcd.drawString("OSC2", 50, 85);
+
+    M5.Lcd.fillRect(10, 130, buttonWidth, buttonHeight, BLUE);
+    M5.Lcd.drawString("OSC3", 50, 145);
+
+    M5.Lcd.fillRect(10, 190, buttonWidth, buttonHeight, BLUE);
+    M5.Lcd.drawString("OSC4", 50, 205);
+
+    // Botones para Efectos y Mixer
+    int largeButtonHeight = 110;
+    int largeButtonWidth = 140;
+
+    M5.Lcd.fillRect(160, 10, largeButtonWidth, largeButtonHeight, GREEN);
+    M5.Lcd.drawString("EFFECTS", 180, 60);
+
+    M5.Lcd.fillRect(160, 130, largeButtonWidth, largeButtonHeight, RED);
+    M5.Lcd.drawString("MIXER", 210, 180);
+}
+
+void displayOscillatorSettings(String oscLabel, Oscillator &osc) {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.print(oscLabel + " Settings");
+
+    // Controles para frecuencia, amplitud y tipo de onda
+    M5.Lcd.setCursor(10, 40);
+    M5.Lcd.print("Freq: " + String(osc.getFrequency()));
+
+    M5.Lcd.setCursor(10, 70);
+    M5.Lcd.print("Amp: " + String(osc.amplitude));
+
+    M5.Lcd.setCursor(10, 100);
+    M5.Lcd.print("Wave: " + osc.getWaveTypeName());
+
+    // Mostrar el desplazamiento de octava
+    displayOctaveShift(osc);
+
+    // Botón de encendido/apagado
+    M5.Lcd.fillRect(10, 130, 100, 50, osc.isOn ? GREEN : RED);
+    M5.Lcd.setCursor(15, 145);
+    M5.Lcd.setTextColor(BLACK);
+    M5.Lcd.print(osc.isOn ? "ON" : "OFF");
+    M5.Lcd.setTextColor(WHITE);
+}
+
+void displayOctaveShift(Oscillator &osc) {
+    M5.Lcd.setCursor(160, 200);
+    M5.Lcd.fillRect(160, 200, 80, 30, BLACK);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.print("OCT=" + String(osc.octaveShift));
+}
+
+void handleOscillatorSettings(String oscLabel, Oscillator &osc) {
+    displayOscillatorSettings(oscLabel, osc);
+    while (true) {
+        M5.update();
+
+        // Leer el encoder1 para ajustar la OCTAVA
+        int currentEncoderState1 = digitalRead(ENCODER1_CLK);
+        if (currentEncoderState1 != lastEncoderState1) {
+            int dtState = digitalRead(ENCODER1_DT);
+            if (dtState == LOW && currentEncoderState1 == HIGH) {
+                osc.updateOctaveShift(-1);
+            } else if (dtState == HIGH && currentEncoderState1 == HIGH) {
+                osc.updateOctaveShift(1);
+            }
+            displayOscillatorSettings(oscLabel, osc);
+        }
+        lastEncoderState1 = currentEncoderState1;
+
+        // Leer el encoder2 para cambiar el tipo de onda
+        int currentEncoderState2 = digitalRead(ENCODER2_CLK);
+        if (currentEncoderState2 != lastEncoderState2) {
+            int dtState = digitalRead(ENCODER2_DT);
+            if (dtState == LOW && currentEncoderState2 == HIGH) {
+                osc.nextWaveType();
+            } else if (dtState == HIGH && currentEncoderState2 == HIGH) {
+                osc.nextWaveType();
+            }
+            displayOscillatorSettings(oscLabel, osc);
+        }
+        lastEncoderState2 = currentEncoderState2;
+
+        if (M5.BtnA.wasPressed()) {
+            displayMainScreen();
+            break;
+        }
+        if (M5.Touch.ispressed()) {
+            TouchPoint_t innerPoint = M5.Touch.getPressPoint();
+            int ix = innerPoint.x;
+            int iy = innerPoint.y;
+            if (ix > 10 && ix < 110 && iy > 130 && iy < 180) {
+                osc.isOn = !osc.isOn;
+                displayOscillatorSettings(oscLabel, osc);
+            }
+        }
+    }
+}
+
+void displayADSRSettings() {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(2);
+
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.print("ADSR Settings");
+
+    // Controles para Attack y Decay en la columna derecha
+    M5.Lcd.setCursor(10, 40);
+    M5.Lcd.print("A: " + String(adsr.attack, 2));
+
+    M5.Lcd.setCursor(10, 70);
+    M5.Lcd.print("D: " + String(adsr.decay, 2));
+
+    // Controles para Sustain y Release en la columna izquierda
+    M5.Lcd.setCursor(160, 40);
+    M5.Lcd.print("S: " + String(adsr.sustain, 2));
+
+    M5.Lcd.setCursor(160, 70);
+    M5.Lcd.print("R: " + String(adsr.release, 2));
+
+    drawADSR();
+}
+
+void drawADSR() {
+    int baseY = 230;
+    int baseX = 10;
+    int width = 300;
+    int height = 100;
+
+    M5.Lcd.fillRect(baseX, baseY - height, width, height, BLACK);
+
+    int attackX = baseX + width * adsr.attack;
+    int decayX = attackX + width * adsr.decay;
+    int sustainY = baseY - height * adsr.sustain;
+    int releaseX = baseX + width * adsr.release;
+
+    M5.Lcd.drawLine(baseX, baseY, attackX, baseY - height, WHITE);
+    M5.Lcd.drawLine(attackX, baseY - height, decayX, sustainY, WHITE);
+    M5.Lcd.drawLine(decayX, sustainY, releaseX, sustainY, WHITE);
+    M5.Lcd.drawLine(releaseX, sustainY, releaseX, baseY, WHITE);
+}
+
+void displayEffectProcessorSettings(const String &effectLabel, const String &effectType) {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setTextSize(2);
+
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.print(effectLabel + " Settings");
+
+    if (effectType == "Reverb") {
+        M5.Lcd.setCursor(10, 40);
+        M5.Lcd.print("Decay: " + String(effectProcessor.reverbDecayFactor, 2));
+
+        M5.Lcd.setCursor(10, 70);
+        M5.Lcd.print("Delay: " + String(effectProcessor.reverbDelayLength));
+        
+        M5.Lcd.fillRect(10, 100, 100, 50, effectProcessor.isReverbOn ? GREEN : RED);
+        M5.Lcd.setCursor(15, 115);
+        M5.Lcd.setTextColor(BLACK);
+        M5.Lcd.print(effectProcessor.isReverbOn ? "ON" : "OFF");
+        M5.Lcd.setTextColor(WHITE);
+    } else if (effectType == "Delay") {
+        M5.Lcd.setCursor(10, 40);
+        M5.Lcd.print("Feedback: " + String(effectProcessor.delayFeedback, 2));
+
+        M5.Lcd.setCursor(10, 70);
+        M5.Lcd.print("Delay: " + String(effectProcessor.delayLength));
+
+        M5.Lcd.fillRect(10, 100, 100, 50, effectProcessor.isDelayOn ? GREEN : RED);
+        M5.Lcd.setCursor(15, 115);
+        M5.Lcd.setTextColor(BLACK);
+        M5.Lcd.print(effectProcessor.isDelayOn ? "ON" : "OFF");
+        M5.Lcd.setTextColor(WHITE);
+    } else if (effectType == "Chorus") {
+        M5.Lcd.setCursor(10, 40);
+        M5.Lcd.print("Depth: " + String(effectProcessor.chorusDepth, 2));
+
+        M5.Lcd.setCursor(10, 70);
+        M5.Lcd.print("Rate: " + String(effectProcessor.chorusRate, 2));
+
+        M5.Lcd.fillRect(10, 100, 100, 50, effectProcessor.isChorusOn ? GREEN : RED);
+        M5.Lcd.setCursor(15, 115);
+        M5.Lcd.setTextColor(BLACK);
+        M5.Lcd.print(effectProcessor.isChorusOn ? "ON" : "OFF");
+        M5.Lcd.setTextColor(WHITE);
+    }
+}
+
+void displayEffectsSettings() {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.print("Effects Settings");
+
+    int buttonHeight = 50;
+    int buttonWidth = 140;
+
+    M5.Lcd.fillRect(10, 70, buttonWidth, buttonHeight, BLUE);
+    M5.Lcd.drawString("Reverb", 50, 85);
+
+    M5.Lcd.fillRect(10, 130, buttonWidth, buttonHeight, BLUE);
+    M5.Lcd.drawString("Delay", 50, 145);
+
+    M5.Lcd.fillRect(10, 190, buttonWidth, buttonHeight, BLUE);
+    M5.Lcd.drawString("Chorus", 50, 205);
+}
+
+void displayMixerSettings() {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.print("Mixer Settings");
+
+    int buttonHeight = 50;
+    int buttonWidth = 140;
+
+    M5.Lcd.fillRect(10, 70, buttonWidth, buttonHeight, BLUE);
+    M5.Lcd.drawString("ADSR", 50, 85);
+
+    M5.Lcd.fillRect(10, 130, buttonWidth, buttonHeight, BLUE);
+    M5.Lcd.drawString("EQ", 50, 145);
+
+    M5.Lcd.fillRect(160, 130, buttonWidth, buttonHeight, lowPassFilter.isOn ? GREEN : RED);
+    M5.Lcd.setCursor(170, 145);
+    M5.Lcd.setTextColor(BLACK);
+    M5.Lcd.print(lowPassFilter.isOn ? "EQ ON" : "EQ OFF");
+    M5.Lcd.setTextColor(WHITE);
+
+    M5.Lcd.fillRect(160, 70, buttonWidth, buttonHeight, adsr.isOn ? GREEN : RED);
+    M5.Lcd.setCursor(170, 85);
+    M5.Lcd.setTextColor(BLACK);
+    M5.Lcd.print(adsr.isOn ? "ADSR ON" : "ADSR OFF");
+    M5.Lcd.setTextColor(WHITE);
+}
+
+void displayEQSettings() {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.print("EQ Settings");
+
+    displayFilterSettings(lowPassFilter, 40);
+    displayFilterSettings(highPassFilter, 40);
+
+    drawEQCurve();
+}
+
+void displayFilterSettings(ButterworthFilter &filter, int yOffset) {
+    M5.Lcd.setCursor(10, yOffset);
+    M5.Lcd.print("Cutoff:" + String(filter.cutoff, 0));
+
+    M5.Lcd.setCursor(10, yOffset + 30);
+    M5.Lcd.print("Resonance: " + String(filter.resonance, 2));
+}
+
+void drawEQCurve() {
+    int baseY = 200;
+    int baseX = 10;
+    int width = 300;
+    int height = 100;
+
+    M5.Lcd.fillRect(baseX, baseY - height, width, height, BLACK);
+
+    M5.Lcd.drawLine(baseX, baseY, baseX + width, baseY, WHITE);
+    M5.Lcd.drawLine(baseX, baseY - height, baseX, baseY, WHITE);
+
+    struct FrequencyLabel {
+        int freq;
+        const char* label;
+        int xOffset;
+    };
+
+    FrequencyLabel freqLabels[] = {
+        {20, "20", 0},
+        {100, "100", 0},
+        {1000, "1k", 0},
+        {5000, "5k", 0},
+        {20000, "20k", -20}
+    };
+
+    for (int i = 0; i < 5; i++) {
+        int x = baseX + log10(freqLabels[i].freq / 20.0) * (width / log10(20000 / 20.0));
+        x += freqLabels[i].xOffset;
+        M5.Lcd.drawLine(x, baseY, x, baseY - height, WHITE);
+        M5.Lcd.setCursor(x - 10, baseY + 5);
+        M5.Lcd.printf("%s", freqLabels[i].label);
+    }
+
+    for (int i = 0; i < width; i++) {
+        float freq = pow(10, log10(20) + (float)i / width * log10(20000 / 20.0));
+        float response = 1 / sqrt(1 + pow(freq / lowPassFilter.cutoff, 2 * 4));
+        int y = baseY - height * response;
+        M5.Lcd.drawPixel(baseX + i, y, RED);
+    }
+
+    for (int i = 0; i < width; i++) {
+        float freq = pow(10, log10(20) + (float)i / width * log10(20000 / 20.0));
+        float response = sqrt(1 / (1 + pow(highPassFilter.cutoff / freq, 2 * 4)));
+        int y = baseY - height * response;
+        M5.Lcd.drawPixel(baseX + i, y, BLUE);
+    }
+}
+
+void handleButtonPress() {
+    for (int i = 0; i < 12; ++i) {
+        bool buttonState = digitalRead(buttonPins[i]) == LOW;
+        if (buttonState != buttonStates[i]) {
+            buttonStates[i] = buttonState;
+            if (buttonState) {
+                float time = (float)millis() / 1000.0;
+                float sample = 0.0;
+
+                for (auto &osc : oscillators) {
+                    sample += osc.generateWave();
+                }
+                sample /= oscillators.size();
+                sample = adsr.applyEnvelope(sample, time);
+                lowPassFilter.applyFilter(sample);
+                highPassFilter.applyFilter(sample);
+
+                effectProcessor.applyReverbEffect(sample);
+                effectProcessor.applyDelayEffect(sample);
+                effectProcessor.applyChorusEffect(sample);
+
+                int output = (int)(127.5 * (sample + 1.0));
+                dacWrite(25, output);
+
+                delayMicroseconds(1000000 / SAMPLE_RATE);
+            }
+        }
+    }
+}
